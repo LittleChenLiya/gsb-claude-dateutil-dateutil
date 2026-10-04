@@ -1,0 +1,7 @@
+Added :mod:`dateutil.schedule`, an adapter that turns a local
+:mod:`dateutil.rrule` recurrence rule into ordered, de-duplicated UTC
+instants over a UTC half-open interval.  Imaginary wall-clock times
+(spring-forward gaps) can be skipped or shifted forward, and ambiguous
+wall-clock times (fall-back overlaps) can resolve to the earlier offset,
+the later offset, or both.  ``COUNT`` and ``UNTIL`` limit the number of
+rule candidates, not the number of output instants.
