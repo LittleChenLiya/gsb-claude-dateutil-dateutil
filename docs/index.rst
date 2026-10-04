@@ -25,6 +25,7 @@ Contents:
    parser
    relativedelta
    rrule
+   schedule
    tz
    tz.win <tzwin>
    utils

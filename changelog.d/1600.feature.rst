@@ -1,0 +1,1 @@
+Added ``dateutil.schedule``, an adapter that expands local-wall-clock ``rrule`` rules into de-duplicated UTC instants with explicit DST gap (skip/forward) and fold (earliest/latest/both) policies and UTC half-open range filtering.
