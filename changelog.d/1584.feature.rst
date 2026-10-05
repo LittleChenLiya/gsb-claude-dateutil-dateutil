@@ -1,0 +1,5 @@
+Added :meth:`rruleset.explain`, which returns explicit candidate
+explanations for a finite, half-open time range: each record keeps every
+rrule/rdate source that produces the instant (the emitted result stays
+deduplicated), identifies exrule/exdate exclusion reasons, and merges
+sources across timezones by UTC instant rather than wall-clock strings.

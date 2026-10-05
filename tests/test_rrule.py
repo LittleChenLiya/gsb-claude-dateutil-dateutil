@@ -8,6 +8,7 @@ from six import PY2
 from dateutil import tz
 from dateutil.rrule import (
     rrule, rruleset, rrulestr,
+    occurrence_record, recurrence_exclusion,
     YEARLY, MONTHLY, WEEKLY, DAILY,
     HOURLY, MINUTELY, SECONDLY,
     MO, TU, WE, TH, FR, SA, SU
@@ -4850,6 +4851,177 @@ class RRuleSetTest(unittest.TestCase):
 
             self.assertEqual(rrset.count(), 5)
             self.assertEqual(rrset.count(), 5)
+
+    # ------------------------------------------------------------------
+    # rruleset.explain: explicit candidate explanation on a finite,
+    # half-open range.  Run locally with:
+    #
+    #     set PYTHONPATH=src
+    #     python -m pytest tests/test_rrule.py -m rruleset -k explain -q
+    #
+    # (on POSIX shells: PYTHONPATH=src python -m pytest ...)
+    # ------------------------------------------------------------------
+    def _explain_set(self, aware=False):
+        # One of each: rrule, rdate, exrule, exdate.
+        rrset = rruleset()
+        if aware:
+            ldn = tz.tzoffset('LDN', 0)
+            nyc = tz.tzoffset('NYC', -5 * 3600)
+            # Infinite rule: explain must not walk past the range end.
+            rrset.rrule(rrule(DAILY,
+                              dtstart=datetime(2024, 1, 1, 9,
+                                               tzinfo=ldn)))
+            # rdate at the same UTC instant as 2024-01-02 09:00 London,
+            # written on a different wall clock.
+            rrset.rdate(datetime(2024, 1, 2, 4, tzinfo=nyc))
+            rrset.exrule(rrule(DAILY, count=1,
+                               dtstart=datetime(2024, 1, 1, 9,
+                                                tzinfo=ldn)))
+            rrset.exdate(datetime(2024, 1, 3, 9, tzinfo=ldn))
+        else:
+            rrset.rrule(rrule(DAILY, count=4,
+                              dtstart=datetime(2024, 1, 1, 9)))
+            # rdate at the exact same instant as an rrule occurrence.
+            rrset.rdate(datetime(2024, 1, 2, 9))
+            rrset.exrule(rrule(DAILY, count=1,
+                               dtstart=datetime(2024, 1, 1, 9)))
+            rrset.exdate(datetime(2024, 1, 3, 9))
+        return rrset
+
+    def testExplainRDateAndRRuleSameInstantMerged(self):
+        rrset = self._explain_set()
+        report = rrset.explain(datetime(2024, 1, 1),
+                               datetime(2024, 1, 5))
+        # Four distinct instants in range (the exdate row is kept so its
+        # reason stays visible); rrule+rdate remain a single merged row.
+        self.assertEqual([r.dt for r in report],
+                         [datetime(2024, 1, 1, 9),
+                          datetime(2024, 1, 2, 9),
+                          datetime(2024, 1, 3, 9),
+                          datetime(2024, 1, 4, 9)])
+        merged = report[1]
+        self.assertIsInstance(merged, occurrence_record)
+        self.assertTrue(merged.included)
+        self.assertEqual(len(merged.sources), 2)
+        self.assertEqual([s.kind for s in merged.sources],
+                         ['rrule', 'rdate'])
+        self.assertEqual([s.index for s in merged.sources], [0, 0])
+        self.assertEqual(merged.excluded_by, ())
+
+    def testExplainExclusionsGiveReasons(self):
+        rrset = self._explain_set()
+        by_exrule = rrset.explain(datetime(2024, 1, 1),
+                                  datetime(2024, 1, 2))[0]
+        by_exdate = rrset.explain(datetime(2024, 1, 3),
+                                  datetime(2024, 1, 4))[0]
+        self.assertFalse(by_exrule.included)
+        self.assertEqual([e.kind for e in by_exrule.excluded_by],
+                         ['exrule'])
+        exrule_ref = by_exrule.excluded_by[0]
+        self.assertIsInstance(exrule_ref, recurrence_exclusion)
+        self.assertEqual(exrule_ref.index, 0)
+        self.assertIs(exrule_ref.rule, rrset._exrule[0])
+        self.assertIs(by_exrule.sources[0].rule, rrset._rrule[0])
+
+        self.assertFalse(by_exdate.included)
+        self.assertEqual([e.kind for e in by_exdate.excluded_by],
+                         ['exdate'])
+        self.assertEqual(by_exdate.excluded_by[0].index, 0)
+        self.assertIsNone(by_exdate.excluded_by[0].rule)
+
+    def testExplainEmittedResultStillDeduped(self):
+        # The rrule/rdate duplicate must appear only once when iterating.
+        rrset = self._explain_set()
+        emitted = list(rrset.between(datetime(2024, 1, 1),
+                                     datetime(2024, 1, 5)))
+        report = rrset.explain(datetime(2024, 1, 1),
+                               datetime(2024, 1, 5))
+        explained_included = [r.dt for r in report if r.included]
+        self.assertEqual(emitted, explained_included)
+        self.assertEqual(emitted.count(datetime(2024, 1, 2, 9)), 1)
+
+    def testExplainDifferentTimezonesMergeOnUTCInstant(self):
+        rrset = self._explain_set(aware=True)
+        report = rrset.explain(
+            datetime(2024, 1, 1, 9, tzinfo=tz.UTC),
+            datetime(2024, 1, 3, 9, tzinfo=tz.UTC))
+        merged = report[1]
+        self.assertEqual(merged.dt,
+                         datetime(2024, 1, 2, 9, tzinfo=tz.UTC))
+        self.assertEqual(len(merged.sources), 2)
+        self.assertEqual([s.kind for s in merged.sources],
+                         ['rrule', 'rdate'])
+        # The two wall clocks differ; identity is the UTC instant, not a
+        # wall-clock string comparison.
+        self.assertNotEqual(str(merged.sources[0].dt),
+                            str(merged.sources[1].dt))
+        self.assertEqual(
+            merged.sources[0].dt.astimezone(tz.UTC),
+            merged.sources[1].dt.astimezone(tz.UTC))
+
+    def testExplainRangeIsHalfOpen(self):
+        rrset = self._explain_set()
+        start = datetime(2024, 1, 1, 9)
+        end = datetime(2024, 1, 3, 9)   # itself an occurrence
+        report = rrset.explain(start, end)
+        days = [r.dt for r in report]
+        # Lower bound included, upper bound excluded.
+        self.assertIn(start, days)
+        self.assertNotIn(end, days)
+        self.assertEqual(days, [datetime(2024, 1, 1, 9),
+                                datetime(2024, 1, 2, 9)])
+        # Degenerate range.
+        self.assertEqual(rrset.explain(start, start), ())
+
+    def testExplainInfiniteRuleIsBoundedByRange(self):
+        # An infinite DAILY rule must return promptly with only the
+        # occurrences inside the range (no traversal of an open future).
+        rrset = rruleset()
+        rrset.rrule(rrule(DAILY, dtstart=datetime(2024, 1, 1, 9)))
+        rrset.exrule(rrule(DAILY, dtstart=datetime(2024, 1, 1, 9)))
+        report = rrset.explain(datetime(2024, 1, 1),
+                               datetime(2024, 1, 8))
+        self.assertEqual(len(report), 7)
+        self.assertTrue(all(not r.included for r in report))
+
+    def testExplainMixedNaiveAndAwareRaisesTypeError(self):
+        rrset = rruleset()
+        rrset.rdate(datetime(2024, 1, 1, 9))
+        rrset.rdate(datetime(2024, 1, 2, 9, tzinfo=tz.UTC))
+        with self.assertRaises(TypeError):
+            rrset.explain(datetime(2024, 1, 1),
+                          datetime(2024, 2, 1))
+
+    def testExplainEmptySet(self):
+        self.assertEqual(
+            rruleset().explain(datetime(2024, 1, 1),
+                               datetime(2024, 2, 1)),
+            ())
+
+    def testExplainFourRulesExample(self):
+        # Mirrors the four-rule example in rruleset.explain's docstring.
+        ldn = tz.tzoffset('LDN', 0)
+        nyc = tz.tzoffset('NYC', -5 * 3600)
+        rrset = rruleset()
+        rrset.rrule(rrule(DAILY, count=3,
+                          dtstart=datetime(2024, 1, 1, 9,
+                                           tzinfo=ldn)))
+        rrset.rdate(datetime(2024, 1, 2, 4, tzinfo=nyc))
+        rrset.exrule(rrule(DAILY, count=1,
+                           dtstart=datetime(2024, 1, 1, 9,
+                                            tzinfo=ldn)))
+        rrset.exdate(datetime(2024, 1, 3, 9, tzinfo=ldn))
+        report = rrset.explain(
+            datetime(2024, 1, 1, 9, tzinfo=ldn),
+            datetime(2024, 1, 4, 0, tzinfo=ldn))
+        summary = [(r.dt.day, r.included,
+                    [s.kind for s in r.sources],
+                    [e.kind for e in r.excluded_by])
+                   for r in report]
+        self.assertEqual(summary,
+                         [(1, False, ['rrule'], ['exrule']),
+                          (2, True, ['rrule', 'rdate'], []),
+                          (3, False, ['rrule'], ['exdate'])])
 
 
 class WeekdayTest(unittest.TestCase):
