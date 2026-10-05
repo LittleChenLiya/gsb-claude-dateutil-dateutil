@@ -4851,6 +4851,117 @@ class RRuleSetTest(unittest.TestCase):
             self.assertEqual(rrset.count(), 5)
             self.assertEqual(rrset.count(), 5)
 
+    # ------------------------------------------------------------------
+    # explain() tests: explicit candidate explanations for a bounded
+    # half-open range [start, end).
+    #
+    # Run just these tests locally with:
+    #   pytest tests/test_rrule.py -m rruleset -k explain
+    # ------------------------------------------------------------------
+    def testExplainRDateAndRRuleSameInstant(self):
+        # rdate and rrule producing the same instant: one result, but
+        # both sources are retained.
+        rrset = rruleset()
+        rrset.rrule(rrule(DAILY, dtstart=datetime(2020, 1, 1), count=3))
+        rrset.rdate(datetime(2020, 1, 2))
+        candidates = rrset.explain(datetime(2020, 1, 1),
+                                   datetime(2020, 1, 4))
+        self.assertEqual([c.dt for c in candidates],
+                         [datetime(2020, 1, 1),
+                          datetime(2020, 1, 2),
+                          datetime(2020, 1, 3)])
+        # The shared instant has two sources, even though it appears once.
+        shared = candidates[1]
+        self.assertEqual(shared.dt, datetime(2020, 1, 2))
+        self.assertEqual(set(shared.sources),
+                         {('rrule', 0), ('rdate', 0)})
+        self.assertIsNone(shared.excluded_by)
+        # The other instants have only the rrule source.
+        self.assertEqual(candidates[0].sources, [('rrule', 0)])
+        self.assertEqual(candidates[2].sources, [('rrule', 0)])
+
+    def testExplainExDateGivesReason(self):
+        # exdate points out *why* a candidate is excluded.
+        rrset = rruleset()
+        rrset.rrule(rrule(DAILY, dtstart=datetime(2020, 1, 1), count=3))
+        rrset.exdate(datetime(2020, 1, 2))
+        candidates = rrset.explain(datetime(2020, 1, 1),
+                                   datetime(2020, 1, 4))
+        self.assertIsNone(candidates[0].excluded_by)
+        self.assertEqual(candidates[1].excluded_by, ('exdate', 0))
+        self.assertIsNone(candidates[2].excluded_by)
+
+    def testExplainExRuleGivesReason(self):
+        # exrule points out *why* a candidate is excluded.
+        rrset = rruleset()
+        rrset.rrule(rrule(DAILY, dtstart=datetime(2020, 1, 1), count=4))
+        rrset.exrule(rrule(DAILY, dtstart=datetime(2020, 1, 2), count=1))
+        candidates = rrset.explain(datetime(2020, 1, 1),
+                                   datetime(2020, 1, 5))
+        self.assertEqual(candidates[1].excluded_by, ('exrule', 0))
+        self.assertIsNone(candidates[0].excluded_by)
+        self.assertIsNone(candidates[2].excluded_by)
+        self.assertIsNone(candidates[3].excluded_by)
+
+    def testExplainDifferentTimezonesSameUTCMerged(self):
+        # Two aware datetimes in different timezones that denote the
+        # same UTC instant are merged into one candidate.  Identity is
+        # by UTC instant, not wall-clock string.
+        utc = tz.tzutc()
+        plus1 = tz.tzoffset(None, 60 * 60)
+        rrset = rruleset()
+        rrset.rdate(datetime(2020, 1, 1, 0, 0, tzinfo=utc))
+        rrset.rdate(datetime(2020, 1, 1, 1, 0, tzinfo=plus1))
+        candidates = rrset.explain(datetime(2020, 1, 1, tzinfo=utc),
+                                   datetime(2020, 1, 2, tzinfo=utc))
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(len(candidates[0].sources), 2)
+        self.assertIsNone(candidates[0].excluded_by)
+
+    def testExplainHalfOpenBoundary(self):
+        # The range is half-open: start is included, end is excluded.
+        rrset = rruleset()
+        rrset.rrule(rrule(DAILY, dtstart=datetime(2020, 1, 1), count=5))
+        candidates = rrset.explain(datetime(2020, 1, 1),
+                                   datetime(2020, 1, 3))
+        self.assertEqual([c.dt for c in candidates],
+                         [datetime(2020, 1, 1), datetime(2020, 1, 2)])
+        # The end boundary is not listed.
+        self.assertNotIn(datetime(2020, 1, 3),
+                         [c.dt for c in candidates])
+
+    def testExplainFourRuleExample(self):
+        # A single rruleset combining rrule, rdate, exrule and exdate.
+        # The rule generates Jan 1..6 daily; rdate adds Jan 8;
+        # exrule removes Jan 3; exdate removes Jan 5.
+        rrset = rruleset()
+        rrset.rrule(rrule(DAILY, dtstart=datetime(2020, 1, 1), count=6))
+        rrset.rdate(datetime(2020, 1, 8))
+        rrset.exrule(rrule(DAILY, dtstart=datetime(2020, 1, 3), count=1))
+        rrset.exdate(datetime(2020, 1, 5))
+        candidates = rrset.explain(datetime(2020, 1, 1),
+                                   datetime(2020, 1, 9))
+        by_dt = {c.dt: c for c in candidates}
+        # All candidates in range are recorded, including excluded ones.
+        self.assertEqual(sorted(by_dt),
+                         [datetime(2020, 1, 1), datetime(2020, 1, 2),
+                          datetime(2020, 1, 3), datetime(2020, 1, 4),
+                          datetime(2020, 1, 5), datetime(2020, 1, 6),
+                          datetime(2020, 1, 8)])
+        # Included: no exclusion reason.
+        for dt in (datetime(2020, 1, 1), datetime(2020, 1, 2),
+                   datetime(2020, 1, 4), datetime(2020, 1, 6),
+                   datetime(2020, 1, 8)):
+            self.assertIsNone(by_dt[dt].excluded_by)
+        # Excluded: reason recorded.
+        self.assertEqual(by_dt[datetime(2020, 1, 3)].excluded_by,
+                         ('exrule', 0))
+        self.assertEqual(by_dt[datetime(2020, 1, 5)].excluded_by,
+                         ('exdate', 0))
+        # The rdate-only instant has just the rdate source.
+        self.assertEqual(by_dt[datetime(2020, 1, 8)].sources,
+                         [('rdate', 0)])
+
 
 class WeekdayTest(unittest.TestCase):
     def testInvalidNthWeekday(self):

@@ -1304,6 +1304,76 @@ class _iterinfo(object):
                 tzinfo=self.rrule._tzinfo),)
 
 
+def _same_instant(a, b):
+    """True if ``a`` and ``b`` represent the same instant.
+
+    For timezone-aware datetimes this compares UTC instants (not
+    wall-clock strings); for naive datetimes it compares wall-clock
+    fields.  This is the identity used to merge candidates from
+    different sources, so two aware datetimes in different timezones
+    that denote the same UTC instant are treated as one candidate.
+    """
+    return a == b
+
+
+def _one_shot(dt, start, end):
+    """Yield ``dt`` once if it falls in the half-open range [start, end)."""
+    if start <= dt < end:
+        yield dt
+
+
+def _bounded(gen, start, end):
+    """Yield values from ``gen`` that fall in the half-open range [start, end).
+
+    ``gen`` is expected to yield values in increasing order (as
+    :class:`rrule` generators do).  Iteration stops as soon as a value
+ at or beyond ``end`` is seen, so the (possibly infinite) future is
+    never walked.  The recurrence algorithm itself is not replaced; the
+    generator is only bounded.
+    """
+    for dt in gen:
+        if dt >= end:
+            break
+        if dt >= start:
+            yield dt
+
+
+class CandidateExplanation(object):
+    """
+    An explicit explanation of a single candidate instant within a
+    bounded recurrence-set query.
+
+    Attributes
+    ----------
+    dt : datetime
+        The candidate instant.  Identity is by UTC instant (for
+        timezone-aware datetimes) or wall-clock (for naive datetimes),
+        never by wall-clock string.
+    sources : list of tuple
+        The sources that produced this candidate, as ``(kind, index)``
+        tuples where ``kind`` is ``'rrule'`` or ``'rdate'`` and
+        ``index`` is the position the source was added to the set.
+        A candidate produced by the same instant from several sources
+        retains every source here, even though the result is
+        de-duplicated to a single candidate.
+    excluded_by : tuple or None
+        ``None`` if the candidate is included in the result, otherwise
+        a ``(kind, index)`` tuple identifying the ``'exrule'`` or
+        ``'exdate'`` that excludes it.
+    """
+    __slots__ = ('dt', 'sources', 'excluded_by')
+
+    def __init__(self, dt):
+        self.dt = dt
+        self.sources = []
+        self.excluded_by = None
+
+    def __repr__(self):
+        return ('CandidateExplanation(dt={0!r}, sources={1!r}, '
+                'excluded_by={2!r})').format(self.dt, self.sources,
+                                             self.excluded_by)
+
+
 class rruleset(rrulebase):
     """ The rruleset type allows more complex recurrence setups, mixing
     multiple rules, dates, exclusion rules, and exclusion dates. The type
@@ -1346,6 +1416,12 @@ class rruleset(rrulebase):
         def __ne__(self, other):
             return self.dt != other.dt
 
+    class _TaggedGenItem(_genitem):
+        """A :class:`_genitem` carrying a ``(kind, index)`` source tag."""
+        def __init__(self, genlist, gen, tag):
+            self.tag = tag
+            super(rruleset._TaggedGenItem, self).__init__(genlist, gen)
+
     def __init__(self, cache=False):
         super(rruleset, self).__init__(cache)
         self._rrule = []
@@ -1379,6 +1455,92 @@ class rruleset(rrulebase):
             exclusion list. Dates included that way will not be generated,
             even if some inclusive rrule or rdate matches them. """
         self._exdate.append(exdate)
+
+    def explain(self, start, end):
+        """
+        Produce an explicit explanation of the recurrence set's
+        candidates within the bounded, half-open time range
+        ``[start, end)``.
+
+        For every distinct instant in the range that is produced by an
+        ``rrule`` or ``rdate`` source, the result records *all* of the
+        sources that produced it and, if the instant is excluded, the
+        ``exrule`` or ``exdate`` that excludes it.  Candidates at the
+        same instant from several sources are merged into a single
+        record (the result is de-duplicated), but every source is
+        retained in ``sources``.  Identity is by UTC instant for
+        timezone-aware datetimes, never by wall-clock string.
+
+        The range is half-open: ``start`` is included and ``end`` is
+        excluded.  Every recurrence generator is bounded by ``end``
+        before being consumed, so this never walks the (possibly
+        infinite) future beyond the range, and the recurrence algorithm
+        itself is not replaced.
+
+        :param start: The lower bound of the range (inclusive).
+        :param end: The upper bound of the range (exclusive).
+        :return: A list of :class:`CandidateExplanation` objects,
+            ordered by instant.
+        """
+        if start >= end:
+            return []
+
+        # Candidate heap: rdate sources followed by rrule sources.
+        rheap = []
+        for idx, rdt in enumerate(self._rdate):
+            self._TaggedGenItem(rheap, _one_shot(rdt, start, end),
+                                ('rdate', idx))
+        for idx, rule in enumerate(self._rrule):
+            self._TaggedGenItem(rheap, _bounded(iter(rule), start, end),
+                                ('rrule', idx))
+        heapq.heapify(rheap)
+
+        # Exclusion heap: exdate sources followed by exrule sources.
+        exheap = []
+        for idx, edt in enumerate(self._exdate):
+            self._TaggedGenItem(exheap, _one_shot(edt, start, end),
+                                ('exdate', idx))
+        for idx, rule in enumerate(self._exrule):
+            self._TaggedGenItem(exheap, _bounded(iter(rule), start, end),
+                                ('exrule', idx))
+        heapq.heapify(exheap)
+
+        results = []
+        current = None
+        last_dt = None
+
+        while rheap:
+            ritem = rheap[0]
+            dt = ritem.dt
+
+            if last_dt is None or not _same_instant(last_dt, dt):
+                # A new distinct instant: finalize the previous record.
+                if current is not None:
+                    results.append(current)
+                current = CandidateExplanation(dt)
+                last_dt = dt
+
+                # Advance exclusions up to (but not past) this candidate.
+                while exheap and exheap[0].dt < dt:
+                    exitem = exheap[0]
+                    advance_iterator(exitem)
+                    if exheap and exheap[0] is exitem:
+                        heapq.heapreplace(exheap, exitem)
+
+                # Record the exclusion reason for this distinct instant.
+                if exheap and _same_instant(exheap[0].dt, dt):
+                    current.excluded_by = exheap[0].tag
+
+            current.sources.append(ritem.tag)
+
+            advance_iterator(ritem)
+            if rheap and rheap[0] is ritem:
+                heapq.heapreplace(rheap, ritem)
+
+        if current is not None:
+            results.append(current)
+
+        return results
 
     def _iter(self):
         rlist = []
