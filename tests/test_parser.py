@@ -2,15 +2,23 @@
 from __future__ import unicode_literals
 
 import itertools
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
+import time
 import unittest
 import sys
 
+from unittest import mock
+
 from dateutil import tz
-from dateutil.tz import tzoffset
 from dateutil.parser import parse, parserinfo
 from dateutil.parser import ParserError
 from dateutil.parser import UnknownTimezoneWarning
+from dateutil.parser import (parse_candidates,
+                             DateCandidate,
+                             CandidateParseResult,
+                             AmbiguousDateError, NoCandidateDateError,
+                             MDY, DMY)
+from dateutil.tz import tzoffset
 
 from ._common import TZEnvContext
 
@@ -962,3 +970,220 @@ def test_parsererror_repr():
     s = repr(ParserError("Problem with string: %s", "2019-01-01"))
 
     assert s == "ParserError('Problem with string: %s', '2019-01-01')"
+
+
+# ---------------------------------------------------------------------------
+# Explicit strict candidate entry point
+#
+# Run these tests with:
+#
+#     pytest tests/test_parser.py -k candidates -v
+#
+# or run the whole parser module with:
+#
+#     pytest tests/test_parser.py -v
+# ---------------------------------------------------------------------------
+
+
+class TestParseCandidates(object):
+    # Three worked inputs: an ambiguous string yielding two distinct
+    # dates, a string where both declared orders force the same actual date
+    # (sources merged), and a string unique under a range restriction.
+    @pytest.mark.parametrize(
+        'timestr, default, kwargs, expected_dates, expected_sources', [
+        ("03/04/2020", datetime(2020, 1, 1), {},
+         [datetime(2020, 3, 4), datetime(2020, 4, 3)],
+         [(MDY,), (DMY,)]),
+        ("25/12/2020", datetime(2020, 1, 1), {},
+         [datetime(2020, 12, 25)],
+         [(MDY, DMY)]),
+        ("03/04/2020", datetime(2020, 1, 1),
+         dict(start=date(2020, 3, 1), end=date(2020, 3, 31)),
+         [datetime(2020, 3, 4)],
+         [(MDY,)]),
+    ])
+    def test_three_input_examples(self, timestr, default, kwargs,
+                                  expected_dates, expected_sources):
+        result = parse_candidates(timestr, default=default, **kwargs)
+        assert isinstance(result, CandidateParseResult)
+        assert [c.datetime for c in result.candidates] == expected_dates
+        assert [c.sources for c in result.candidates] == expected_sources
+
+    def test_both_orders_allowed_is_ambiguous(self):
+        # 03/04/2020 with both orders allowed is reported as ambiguous;
+        # the parser does not silently pick one via dayfirst.
+        result = parse_candidates("03/04/2020",
+                                  default=datetime(2020, 1, 1))
+
+        assert result.status == CandidateParseResult.AMBIGUOUS
+        assert len(result.candidates) == 2
+
+        assert result.candidates[0] == DateCandidate(datetime(2020, 3, 4),
+                                                     MDY)
+        assert result.candidates[1] == DateCandidate(datetime(2020, 4, 3),
+                                                     DMY)
+
+        with pytest.raises(AmbiguousDateError):
+            result.datetime
+
+    def test_range_restriction_leaves_unique_march(self):
+        # Limiting the allowed range to March leaves only March 4th;
+        # the April interpretation is filtered out rather than guessed.
+        result = parse_candidates(
+            "03/04/2020", default=datetime(2020, 1, 1),
+            start=date(2020, 3, 1), end=date(2020, 3, 31))
+
+        assert result.status == CandidateParseResult.UNIQUE
+        assert result.datetime == datetime(2020, 3, 4)
+        assert result.candidates[0].sources == (MDY,)
+
+    @pytest.mark.parametrize('default_year', [1999, 2010])
+    def test_missing_year_comes_from_injected_default(self, default_year):
+        # A missing year must not be silently filled from today; it comes
+        # from the injected base date, and changing the base changes the
+        # result in a controlled way.
+        default = datetime(default_year, 6, 15, 9, 30)
+        result = parse_candidates("03/04", default=default)
+
+        assert result.status == CandidateParseResult.AMBIGUOUS
+        assert ([c.datetime for c in result.candidates] ==
+                [datetime(default_year, 3, 4, 9, 30),
+                 datetime(default_year, 4, 3, 9, 30)])
+
+    def test_missing_year_independent_of_today(self):
+        # Whichever day the suite happens to run on, neither the status nor
+        # the year may depend on the clock: only on ``default``.
+        result = parse_candidates("03/04", default=datetime(2020, 1, 1))
+
+        assert result.status == CandidateParseResult.AMBIGUOUS
+        for candidate in result.candidates:
+            assert candidate.datetime.year == 2020
+
+    def test_result_does_not_depend_on_clock(self):
+        def resolve():
+            return [(c.datetime, c.sources)
+                    for c in parse_candidates("03/04",
+                                              default=datetime(2020, 7, 15)
+                                              ).candidates]
+
+        expected = resolve()
+
+        class _StructTime(object):
+            def __init__(self, year):
+                self.tm_year = year
+
+        for fake_year in (1970, 2038, 2099):
+            with mock.patch.object(time, 'localtime',
+                                   return_value=_StructTime(fake_year)):
+                assert resolve() == expected
+
+    def test_same_actual_date_merges_sources(self):
+        # Both declared orders resolve 10/10/2020 to the same actual date,
+        # so they are merged into one candidate recording both as sources.
+        result = parse_candidates("10/10/2020",
+                                  default=datetime(2020, 1, 1))
+
+        assert result.status == CandidateParseResult.UNIQUE
+        assert result.datetime == datetime(2020, 10, 10)
+        assert len(result.candidates) == 1
+        assert result.candidates[0].sources == (MDY, DMY)
+
+    def test_single_declared_order(self):
+        result = parse_candidates("03/04/2020",
+                                  default=datetime(2020, 1, 1),
+                                  orders=[DMY])
+
+        assert result.status == CandidateParseResult.UNIQUE
+        assert result.datetime == datetime(2020, 4, 3)
+
+    def test_no_solution(self):
+        # Neither interpretation of 31/02/2020 is a real date.
+        result = parse_candidates("31/02/2020",
+                                  default=datetime(2020, 1, 1))
+
+        assert result.status == CandidateParseResult.NO_SOLUTION
+        assert result.candidates == ()
+        with pytest.raises(NoCandidateDateError):
+            result.datetime
+
+    def test_all_candidates_filtered_out_by_range(self):
+        result = parse_candidates(
+            "03/04/2020", default=datetime(2020, 1, 1),
+            start=datetime(2021, 1, 1))
+
+        assert result.status == CandidateParseResult.NO_SOLUTION
+
+    def test_default_is_mandatory(self):
+        # The strict entry point never reads today; ``default`` is required.
+        with pytest.raises(TypeError):
+            parse_candidates("03/04/2020")
+
+    def test_invalid_order_rejected(self):
+        with pytest.raises(ValueError):
+            parse_candidates("03/04/2020",
+                             default=datetime(2020, 1, 1),
+                             orders=["YMD"])
+
+    def test_empty_orders_rejected(self):
+        with pytest.raises(ValueError):
+            parse_candidates("03/04/2020",
+                             default=datetime(2020, 1, 1),
+                             orders=[])
+
+    def test_two_digit_year_anchored_on_default(self):
+        # Two-digit year conversion is anchored on the injected default
+        # rather than on today's year.
+        result = parse_candidates("03/04/80",
+                                  default=datetime(1999, 1, 1))
+
+        years = {c.datetime.year for c in result.candidates}
+        assert years == {1980}
+
+    def test_parserinfo_reference_year(self):
+        info = parserinfo(reference_year=1999)
+        assert info.convertyear(80) == 1980
+        assert info.convertyear(40) == 2040
+
+    def test_default_parse_unchanged(self):
+        # The legacy forgiving entry point keeps its dayfirst guessing and
+        # its default-fill behavior.
+        assert parse("03/04/2020") == datetime(2020, 3, 4)
+        assert parse("03/04", dayfirst=True,
+                     default=datetime(2020, 1, 1)) == datetime(2020, 4, 3)
+
+    def test_date_bounds_are_inclusive(self):
+        # A datetime.date bound covers the whole of its last day, so a
+        # midnight parsing on the boundary date is still included.
+        result = parse_candidates(
+            "03/04/2020", default=datetime(2020, 1, 1),
+            start=date(2020, 4, 1), end=date(2020, 4, 3))
+
+        assert result.status == CandidateParseResult.UNIQUE
+        assert result.datetime == datetime(2020, 4, 3)
+
+    def test_time_is_filled_from_default(self):
+        default = datetime(2020, 1, 1, 8, 15, 45)
+        result = parse_candidates("03/04/2020", default=default)
+
+        assert {c.datetime.time()
+                for c in result.candidates} == {datetime(2020, 1, 1,
+                                                         8, 15, 45).time()}
+
+    def test_timezone_aware_candidates(self):
+        default = datetime(2020, 1, 1)
+        result = parse_candidates("03/04/2020 05:00 UTC", default=default)
+
+        assert all(c.datetime.tzinfo is not None
+                   for c in result.candidates)
+
+    def test_naive_aware_range_mismatch_raises_parsererror(self):
+        with pytest.raises(ParserError):
+            parse_candidates("03/04/2020 05:00 UTC",
+                             default=datetime(2020, 1, 1),
+                             start=datetime(2020, 1, 1))
+
+    def test_invalid_bound_type(self):
+        with pytest.raises(TypeError):
+            parse_candidates("03/04/2020",
+                             default=datetime(2020, 1, 1),
+                             start="2020-01-01")

@@ -30,6 +30,7 @@ Additional resources about date/time string formats can be found below:
 """
 from __future__ import unicode_literals
 
+import copy
 import datetime
 import re
 import string
@@ -42,6 +43,7 @@ from io import StringIO
 import six
 from six import integer_types, text_type
 
+from collections import OrderedDict
 from decimal import Decimal
 
 from warnings import warn
@@ -49,7 +51,15 @@ from warnings import warn
 from .. import relativedelta
 from .. import tz
 
-__all__ = ["parse", "parserinfo", "ParserError"]
+__all__ = ["parse", "parserinfo", "ParserError", "parse_candidates"]
+
+
+# Declared interpretations for a date whose day/month order is ambiguous.
+# ``MDY`` is month-first (e.g. "03/04/2020" -> March 4), ``DMY`` is
+# day-first (e.g. "03/04/2020" -> April 3).
+MDY = 'MDY'
+DMY = 'DMY'
+_VALID_ORDERS = (MDY, DMY)
 
 
 # TODO: pandas.core.tools.datetimes imports this explicitly.  Might be worth
@@ -254,6 +264,13 @@ class parserinfo(object):
         (e.g. 01/05/09) as the year. If ``True``, the first number is taken
         to be the year, otherwise the last number is taken to be the year.
         Default is ``False``.
+
+    :param reference_year:
+        The year used as an anchor when converting two-digit years to
+        four-digit years.  If ``None`` (the default), the year is taken from
+        the current local time, preserving the historical behavior.  Passing
+        an explicit value makes the resolution independent of the current
+        date (used by the strict candidate entry point).
     """
 
     # m from a.m/p.m, t from ISO T separator
@@ -291,7 +308,7 @@ class parserinfo(object):
     # TODO: ERA = ["AD", "BC", "CE", "BCE", "Stardate",
     #              "Anno Domini", "Year of Our Lord"]
 
-    def __init__(self, dayfirst=False, yearfirst=False):
+    def __init__(self, dayfirst=False, yearfirst=False, reference_year=None):
         self._jump = self._convert(self.JUMP)
         self._weekdays = self._convert(self.WEEKDAYS)
         self._months = self._convert(self.MONTHS)
@@ -303,7 +320,11 @@ class parserinfo(object):
         self.dayfirst = dayfirst
         self.yearfirst = yearfirst
 
-        self._year = time.localtime().tm_year
+        self._reference_year = reference_year
+        if reference_year is None:
+            self._year = time.localtime().tm_year
+        else:
+            self._year = reference_year
         self._century = self._year // 100 * 100
 
     def _convert(self, lst):
@@ -565,6 +586,116 @@ class _ymd(list):
         return year, month, day
 
 
+class DateCandidate(object):
+    """
+    One concrete date interpretation produced while resolving an
+    ambiguously ordered date string.
+
+    In addition to the attributes documented below, a candidate compares
+    equal to the ``(candidate.datetime, candidate.order)`` pair.
+
+    :ivar datetime:
+        The :class:`datetime.datetime` produced by this interpretation.
+
+    :ivar order:
+        The declared order under which the datetime was first produced
+        (one of :data:`MDY` or :data:`DMY`).
+
+    :ivar sources:
+        Tuple of the declared orders (in declaration order) that all
+        resolve to :attr:`datetime`.
+    """
+    __slots__ = ('datetime', 'order', 'sources')
+
+    def __init__(self, datetime, order, sources=None):
+        self.datetime = datetime
+        self.order = order
+        self.sources = tuple(sources) if sources else (order,)
+
+    def __iter__(self):
+        return iter((self.datetime, self.order))
+
+    def __eq__(self, other):
+        if isinstance(other, DateCandidate):
+            return (self.datetime == other.datetime and
+                    self.order == other.order)
+        if isinstance(other, tuple):
+            return tuple(self) == other
+        return NotImplemented
+
+    def __ne__(self, other):
+        result = self.__eq__(other)
+        return result if result is NotImplemented else not result
+
+    def __hash__(self):
+        return hash((self.datetime, self.order))
+
+    def __repr__(self):
+        return ("DateCandidate(datetime=%r, order=%r, sources=%r)" %
+                (self.datetime, self.order, self.sources))
+
+
+class CandidateParseResult(object):
+    """
+    Outcome of :meth:`parser.parse_candidates`: the surviving declared
+    candidates after the caller's date range and default-field policy have
+    been applied.
+
+    ``result.status`` is one of:
+
+    - ``'unique'``: exactly one distinct datetime survives.
+    - ``'ambiguous'``: more than one distinct datetime survives.
+    - ``'no_solution'``: no candidate parsed or survived the range.
+
+    :ivar candidates:
+        Tuple of :class:`DateCandidate` objects in declared order; two
+        different interpretations yielding the same actual datetime are
+        merged into one candidate whose ``sources`` lists both orders.
+    """
+
+    UNIQUE = 'unique'
+    AMBIGUOUS = 'ambiguous'
+    NO_SOLUTION = 'no_solution'
+
+    def __init__(self, timestr, candidates):
+        self.timestr = timestr
+        self.candidates = tuple(candidates)
+
+    @property
+    def status(self):
+        if len(self.candidates) == 0:
+            return self.NO_SOLUTION
+        elif len(self.candidates) == 1:
+            return self.UNIQUE
+        else:
+            return self.AMBIGUOUS
+
+    @property
+    def datetime(self):
+        """
+        Return the unique resolved :class:`datetime.datetime`.
+
+        :raises AmbiguousDateError:
+            Raised if :attr:`status` is ``'ambiguous'``.
+        :raises NoCandidateDateError:
+            Raised if :attr:`status` is ``'no_solution'``.
+        """
+        if self.status == self.AMBIGUOUS:
+            raise AmbiguousDateError(
+                "Date string %r is ambiguous: %s",
+                self.timestr,
+                ", ".join(text_type(cand.datetime) for cand in self.candidates))
+        elif self.status == self.NO_SOLUTION:
+            raise NoCandidateDateError(
+                "No declared date candidate is valid for %r", self.timestr)
+
+        return self.candidates[0].datetime
+
+    def __repr__(self):
+        return ("CandidateParseResult(status=%r, candidates=%r)" %
+                (self.status, self.candidates))
+
+
 class parser(object):
     def __init__(self, info=None):
         self.info = info or parserinfo()
@@ -657,6 +788,147 @@ class parser(object):
             return ret, skipped_tokens
         else:
             return ret
+
+    def parse_candidates(self, timestr, default,
+                         orders=(MDY, DMY),
+                         start=None, end=None,
+                         ignoretz=False, tzinfos=None, fuzzy=False):
+        """
+        Strictly parse ``timestr`` under each declared day/month ordering
+        and report the candidate dates that survive.
+
+        Unlike :meth:`parse`, this never silently guesses an ordering via
+        ``dayfirst`` and never reads today's date: ``default`` is mandatory
+        and is the sole source both for the fields missing from the string
+        and for the anchor used when converting two-digit years.
+
+        :param timestr:
+            Any date/time string using the supported formats.
+
+        :param default:
+            Mandatory :class:`datetime.datetime` used as the base for every
+            interpretation; fields absent from ``timestr`` are taken from
+            it.  A missing year therefore comes from ``default`` rather than
+            from the current date.
+
+        :param orders:
+            Iterable of declared orders, drawn from :data:`MDY` (month
+            first) and :data:`DMY` (day first).  Each is tried in the given
+            order; duplicates are ignored.  Defaults to ``(MDY, DMY)``.
+
+        :param start:
+            Optional inclusive lower bound.  May be a
+            :class:`datetime.datetime` or a :class:`datetime.date` (which is
+            taken as midnight of that day).  Interpretations strictly
+            before it are discarded.
+
+        :param end:
+            Optional inclusive upper bound, with the same types and
+            conversion rules as ``start``.
+
+        :param ignoretz:
+            If ``True``, time zones in the string are ignored.
+
+        :param tzinfos:
+            Additional time zone names/aliases, as in :meth:`parse`.
+
+        :param fuzzy:
+            Whether to allow fuzzy parsing, as in :meth:`parse`.
+
+        :return:
+            A :class:`CandidateParseResult` whose ``status`` is ``'unique'``,
+            ``'ambiguous'`` or ``'no_solution'`` and whose ``candidates``
+            lists the surviving interpretations; two declared orders
+            resolving to the same actual datetime are merged into one
+            candidate recording both as sources.
+
+        :raises ParserError:
+            Raised for invalid or unknown string formats.
+        """
+        if not isinstance(default, datetime.datetime):
+            raise TypeError("parse_candidates requires an explicit "
+                            "datetime 'default'; got %r" % (default,))
+
+        seen_orders = []
+        for order in orders:
+            if order not in _VALID_ORDERS:
+                raise ValueError(
+                    "Unknown date order %r; expected one of %r" %
+                    (order, _VALID_ORDERS))
+            if order not in seen_orders:
+                seen_orders.append(order)
+
+        if not seen_orders:
+            raise ValueError("At least one date order must be declared")
+
+        # The parserinfo may anchor two-digit years on today's year; for the
+        # strict entry point we anchor on the injected default instead, so
+        # that no part of the resolution depends on the current date.
+        info = self.info
+        if getattr(info, '_reference_year', None) is None:
+            info = copy.copy(info)
+            info._year = default.year
+            info._century = info._year // 100 * 100
+
+        candidate_parser = parser(info)
+
+        range_start = self._range_bound(start, datetime.time.min)
+        range_end = self._range_bound(end, datetime.time.max)
+
+        merged = OrderedDict()
+        for order in seen_orders:
+            dayfirst = order == DMY
+
+            try:
+                res, _ = candidate_parser._parse(timestr,
+                                                 dayfirst=dayfirst,
+                                                 yearfirst=False,
+                                                 fuzzy=fuzzy)
+
+                if res is None or len(res) == 0:
+                    raise ParserError("Unknown string format: %s", timestr)
+
+                candidate_dt = candidate_parser._build_naive(res, default)
+
+                if not ignoretz:
+                    candidate_dt = candidate_parser._build_tzaware(
+                        candidate_dt, res, tzinfos)
+            except (ParserError, ValueError, OverflowError):
+                # This declared order yields no interpretable date.
+                continue
+
+            try:
+                if range_start is not None and candidate_dt < range_start:
+                    continue
+                if range_end is not None and candidate_dt > range_end:
+                    continue
+            except TypeError as e:
+                # Most likely a mix of naive and aware datetimes between the
+                # parsed result and the caller's range.
+                six.raise_from(
+                    ParserError("Cannot compare %r with the date range: %s",
+                                timestr, e), e)
+
+            if candidate_dt in merged:
+                existing = merged[candidate_dt]
+                existing.sources = existing.sources + (order,)
+            else:
+                merged[candidate_dt] = DateCandidate(candidate_dt, order)
+
+        return CandidateParseResult(timestr, list(merged.values()))
+
+    @staticmethod
+    def _range_bound(bound, end_time):
+        if bound is None:
+            return None
+
+        if isinstance(bound, datetime.datetime):
+            return bound
+        elif isinstance(bound, datetime.date):
+            return datetime.datetime.combine(bound, end_time)
+
+        raise TypeError("Date range bounds must be datetime or date, "
+                        "got %r" % (bound,))
 
     class _result(_resultbase):
         __slots__ = ["year", "month", "day", "weekday",
@@ -1368,6 +1640,58 @@ def parse(timestr, parserinfo=None, **kwargs):
         return DEFAULTPARSER.parse(timestr, **kwargs)
 
 
+def parse_candidates(timestr, default, parserinfo=None, **kwargs):
+    """
+
+    Strictly parse ``timestr`` under each declared day/month ordering,
+    without silently guessing via ``dayfirst`` and without reading today's
+    date.  This is the explicit candidate counterpart of :func:`parse`.
+
+    :param timestr:
+        A string containing a date/time stamp.
+
+    :param default:
+        Mandatory :class:`datetime.datetime` providing every field missing
+        from ``timestr`` (including a missing year); this is the only
+        "current date" used during resolution.
+
+    :param parserinfo:
+        A :class:`parserinfo` object containing parameters for the parser.
+        If ``None``, the default :class:`parserinfo` is used.
+
+    The remaining keyword arguments are documented on
+    :meth:`parser.parse_candidates` (``orders``, ``start``, ``end``,
+    ``ignoretz``, ``tzinfos`` and ``fuzzy``).
+
+    :return:
+        A :class:`CandidateParseResult`; access ``result.status`` to see
+        whether the resolution is ``'unique'``, ``'ambiguous'`` or
+        ``'no_solution'``, or call ``result.datetime`` to obtain the unique
+        datetime (raising :class:`AmbiguousDateError` or
+        :class:`NoCandidateDateError` otherwise).
+
+    .. doctest::
+       :options: +NORMALIZE_WHITESPACE
+
+        >>> from datetime import datetime
+        >>> from dateutil.parser import parse_candidates
+        >>> default = datetime(2020, 1, 1)
+        >>> result = parse_candidates("03/04/2020", default=default)
+        >>> result.status
+        'ambiguous'
+        >>> march = (datetime(2020, 3, 1), datetime(2020, 3, 31))
+        >>> parse_candidates("03/04/2020", default=default,
+        ...                  start=march[0], end=march[1]).datetime
+        datetime.datetime(2020, 3, 4, 0, 0)
+    """
+    if parserinfo:
+        p = parser(parserinfo)
+    else:
+        p = DEFAULTPARSER
+
+    return p.parse_candidates(timestr, default=default, **kwargs)
+
+
 class _tzparser(object):
 
     class _result(_resultbase):
@@ -1609,5 +1933,21 @@ class UnknownTimezoneWarning(RuntimeWarning):
     """Raised when the parser finds a timezone it cannot parse into a tzinfo.
 
     .. versionadded:: 2.7.0
+    """
+
+
+class AmbiguousDateError(ParserError):
+    """Raised when an ambiguously ordered string admits more than one
+    in-range date and the caller asks for the unique datetime.
+
+    .. versionadded:: 2.9.0
+    """
+
+
+class NoCandidateDateError(ParserError):
+    """Raised when none of the declared candidates produces an in-range
+    date and the caller asks for the unique datetime.
+
+    .. versionadded:: 2.9.0
     """
 # vim:ts=4:sw=4:et
