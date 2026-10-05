@@ -11,6 +11,7 @@ from dateutil.tz import tzoffset
 from dateutil.parser import parse, parserinfo
 from dateutil.parser import ParserError
 from dateutil.parser import UnknownTimezoneWarning
+from dateutil.parser import parse_strict, StrictParser, StrictParseResult
 
 from ._common import TZEnvContext
 
@@ -962,3 +963,166 @@ def test_parsererror_repr():
     s = repr(ParserError("Problem with string: %s", "2019-01-01"))
 
     assert s == "ParserError('Problem with string: %s', '2019-01-01')"
+
+
+# ---------------------------------------------------------------------------
+# Strict candidate-based parser tests
+# ---------------------------------------------------------------------------
+
+# Both day/month orders declared as candidates.
+BOTH_ORDERS = [{"dayfirst": True}, {"dayfirst": False}]
+
+
+class TestStrictParser(object):
+    """
+    Tests for :func:`parse_strict` and :class:`StrictParser`.
+
+    The three canonical input examples that exercise every outcome are:
+
+    - ``"03/04/2020"`` -- ambiguous under both day/month orders;
+    - ``"13/04/2020"`` -- unique (both orders resolve to the same date);
+    - ``"31/04/2020"`` -- no solution (31 is not a valid April day).
+    """
+
+    def test_three_input_examples(self):
+        # 1. Ambiguous: 03/04/2020 under both orders yields two dates.
+        res = parse_strict("03/04/2020", BOTH_ORDERS)
+        assert res.status == StrictParseResult.AMBIGUOUS
+        assert res.datetime is None
+        assert bool(res) is False
+        assert len(res.candidates) == 2
+        dates = [dt for _, dt in res.candidates]
+        assert datetime(2020, 4, 3) in dates
+        assert datetime(2020, 3, 4) in dates
+
+        # 2. Unique: 13/04/2020 under both orders resolves to one date.
+        res = parse_strict("13/04/2020", BOTH_ORDERS)
+        assert res.status == StrictParseResult.UNIQUE
+        assert res.datetime == datetime(2020, 4, 13)
+        assert bool(res) is True
+        assert len(res.candidates) == 1
+
+        # 3. No solution: 31/04/2020 is invalid under both orders.
+        res = parse_strict("31/04/2020", BOTH_ORDERS)
+        assert res.status == StrictParseResult.NO_SOLUTION
+        assert res.datetime is None
+        assert bool(res) is False
+        assert res.candidates == []
+
+    def test_ambiguous_reports_ambiguous(self):
+        # 03/04/2020 with both orders allowed is ambiguous.
+        res = parse_strict("03/04/2020", BOTH_ORDERS)
+        assert res.status == StrictParseResult.AMBIGUOUS
+        assert res.datetime is None
+
+    def test_date_range_limits_to_march(self):
+        # Limiting to March leaves only the month-first interpretation.
+        march = (datetime(2020, 3, 1), datetime(2020, 3, 31))
+        res = parse_strict("03/04/2020", BOTH_ORDERS, date_range=march)
+        assert res.status == StrictParseResult.UNIQUE
+        assert res.datetime == datetime(2020, 3, 4)
+        assert len(res.candidates) == 1
+
+    def test_date_range_limits_to_april(self):
+        # Limiting to April leaves only the day-first interpretation.
+        april = (datetime(2020, 4, 1), datetime(2020, 4, 30))
+        res = parse_strict("03/04/2020", BOTH_ORDERS, date_range=april)
+        assert res.status == StrictParseResult.UNIQUE
+        assert res.datetime == datetime(2020, 4, 3)
+
+    def test_date_range_excludes_all(self):
+        # A range that excludes every candidate yields no solution.
+        may = (datetime(2020, 5, 1), datetime(2020, 5, 31))
+        res = parse_strict("03/04/2020", BOTH_ORDERS, date_range=may)
+        assert res.status == StrictParseResult.NO_SOLUTION
+
+    def test_missing_year_no_default_is_no_solution(self):
+        # Without an injected base date, a missing year must not silently
+        # fall back to the current year.
+        res = parse_strict("03/04", BOTH_ORDERS)
+        assert res.status == StrictParseResult.NO_SOLUTION
+        assert res.datetime is None
+
+    def test_missing_year_with_injected_default(self):
+        # With an injected base date, the missing year comes from it.
+        res = parse_strict("03/04", BOTH_ORDERS,
+                           default=datetime(2020, 1, 1))
+        assert res.status == StrictParseResult.AMBIGUOUS
+        dates = [dt for _, dt in res.candidates]
+        assert datetime(2020, 4, 3) in dates
+        assert datetime(2020, 3, 4) in dates
+
+    def test_base_date_change_is_controllable(self):
+        # Changing the injected base date changes the result predictably.
+        march_2020 = (datetime(2020, 3, 1), datetime(2020, 3, 31))
+        march_2021 = (datetime(2021, 3, 1), datetime(2021, 3, 31))
+
+        res_2020 = parse_strict("03/04", BOTH_ORDERS,
+                                 default=datetime(2020, 1, 1),
+                                 date_range=march_2020)
+        res_2021 = parse_strict("03/04", BOTH_ORDERS,
+                                default=datetime(2021, 1, 1),
+                                date_range=march_2021)
+
+        assert res_2020.status == StrictParseResult.UNIQUE
+        assert res_2021.status == StrictParseResult.UNIQUE
+        assert res_2020.datetime == datetime(2020, 3, 4)
+        assert res_2021.datetime == datetime(2021, 3, 4)
+        assert res_2020.datetime != res_2021.datetime
+
+    def test_candidates_merging_same_datetime(self):
+        # Two candidates that resolve to the same datetime are merged into
+        # a single entry with both sources recorded.
+        res = parse_strict("13/04/2020", BOTH_ORDERS)
+        assert res.status == StrictParseResult.UNIQUE
+        assert len(res.candidates) == 1
+        sources, dt = res.candidates[0]
+        assert dt == datetime(2020, 4, 13)
+        assert len(sources) == 2
+
+    def test_empty_candidates_is_no_solution(self):
+        res = parse_strict("03/04/2020", [])
+        assert res.status == StrictParseResult.NO_SOLUTION
+
+    def test_single_candidate(self):
+        # A single declared candidate is never ambiguous.
+        res = parse_strict("03/04/2020", [{"dayfirst": True}])
+        assert res.status == StrictParseResult.UNIQUE
+        assert res.datetime == datetime(2020, 4, 3)
+
+        res = parse_strict("03/04/2020", [{"dayfirst": False}])
+        assert res.status == StrictParseResult.UNIQUE
+        assert res.datetime == datetime(2020, 3, 4)
+
+    def test_default_parse_unchanged(self):
+        # The default :func:`parse` must keep its existing behaviour.
+        assert parse("03/04/2020") == datetime(2020, 3, 4)
+        assert parse("13/04/2020") == datetime(2020, 4, 13)
+
+    def test_strict_parser_class(self):
+        # The :class:`StrictParser` entry point works the same way.
+        p = StrictParser()
+        res = p.parse("03/04/2020", BOTH_ORDERS)
+        assert res.status == StrictParseResult.AMBIGUOUS
+
+    def test_strict_parser_with_parserinfo(self):
+        # A custom :class:`parserinfo` is honoured.
+        info = parserinfo(dayfirst=True)
+        p = StrictParser(info)
+        res = p.parse("03/04/2020", [{"dayfirst": None}])
+        assert res.status == StrictParseResult.UNIQUE
+        assert res.datetime == datetime(2020, 4, 3)
+
+    def test_ignoretz(self):
+        # Time zones are ignored when ``ignoretz=True``.
+        res = parse_strict("03/04/2020 12:00 UTC", BOTH_ORDERS,
+                           ignoretz=True)
+        assert res.status == StrictParseResult.AMBIGUOUS
+        for _, dt in res.candidates:
+            assert dt.tzinfo is None
+
+    def test_result_repr(self):
+        res = parse_strict("13/04/2020", BOTH_ORDERS)
+        r = repr(res)
+        assert "StrictParseResult" in r
+        assert "unique" in r

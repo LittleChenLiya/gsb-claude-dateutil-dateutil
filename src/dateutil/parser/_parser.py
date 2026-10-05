@@ -49,7 +49,8 @@ from warnings import warn
 from .. import relativedelta
 from .. import tz
 
-__all__ = ["parse", "parserinfo", "ParserError"]
+__all__ = ["parse", "parserinfo", "ParserError",
+           "parse_strict", "StrictParser", "StrictParseResult"]
 
 
 # TODO: pandas.core.tools.datetimes imports this explicitly.  Might be worth
@@ -1366,6 +1367,274 @@ def parse(timestr, parserinfo=None, **kwargs):
         return parser(parserinfo).parse(timestr, **kwargs)
     else:
         return DEFAULTPARSER.parse(timestr, **kwargs)
+
+
+class StrictParseResult(object):
+    """
+    The outcome of strict candidate-based parsing.
+
+    Instead of a single :class:`datetime.datetime`, the strict parser reports
+    one of three states:
+
+    - :attr:`UNIQUE` -- exactly one distinct datetime satisfies every declared
+      candidate, the date range and the default field policy.
+    - :attr:`AMBIGUOUS` -- more than one distinct datetime satisfies every
+      constraint.
+    - :attr:`NO_SOLUTION` -- no candidate produced a valid datetime.
+
+    Candidates that resolve to the same actual datetime are merged into a
+    single entry in :attr:`candidates`, so the caller can see which declared
+    interpretations converged.
+
+    :cvar UNIQUE: The input has exactly one valid interpretation.
+    :cvar AMBIGUOUS: The input has more than one valid interpretation.
+    :cvar NO_SOLUTION: The input has no valid interpretation.
+
+    :ivar status: One of :attr:`UNIQUE`, :attr:`AMBIGUOUS` or
+        :attr:`NO_SOLUTION`.
+    :ivar datetime: The unique parsed :class:`datetime.datetime`. Only set
+        when :attr:`status` is :attr:`UNIQUE`; otherwise ``None``.
+    :ivar candidates: A list of ``(sources, datetime)`` tuples for every valid
+        interpretation. ``sources`` is a list of the candidate dicts that
+        produced that datetime. Candidates resolving to the same datetime are
+        merged into one entry.
+    """
+    UNIQUE = 'unique'
+    AMBIGUOUS = 'ambiguous'
+    NO_SOLUTION = 'no_solution'
+
+    __slots__ = ('status', 'datetime', 'candidates')
+
+    def __init__(self, status, datetime=None, candidates=None):
+        self.status = status
+        self.datetime = datetime
+        self.candidates = candidates if candidates is not None else []
+
+    def __bool__(self):
+        """``True`` when the parse yielded a single unique datetime."""
+        return self.status == self.UNIQUE
+
+    __nonzero__ = __bool__
+
+    def __repr__(self):
+        return ('{cls}(status={status!r}, datetime={dt!r}, '
+                'candidates={cand!r})').format(
+            cls=self.__class__.__name__,
+            status=self.status,
+            dt=self.datetime,
+            cand=self.candidates)
+
+
+class StrictParser(parser):
+    """
+    A parser that resolves ambiguous day/month orders by trying explicit
+    candidate interpretations.
+
+    The default :class:`parser` guesses a single day/month order (driven by
+    ``dayfirst``/``yearfirst``) and returns one datetime. This is not
+    appropriate when the caller needs to know whether an input is genuinely
+    ambiguous. :class:`StrictParser` instead:
+
+    1. tries every declared candidate interpretation,
+    2. keeps only those results that satisfy the caller's date range and
+       default field policy,
+    3. merges candidates that resolve to the same actual datetime, and
+    4. reports whether the outcome is :attr:`~StrictParseResult.UNIQUE`,
+       :attr:`~StrictParseResult.AMBIGUOUS` or
+       :attr:`~StrictParseResult.NO_SOLUTION`.
+
+    The parser never consults the current date. Missing fields are taken
+    from the injected ``default`` base date; if no base date is injected and
+    a year/month/day field is missing, the candidate is treated as having no
+    solution rather than silently borrowing the current year.
+    """
+
+    def parse(self, timestr, candidates, default=None, date_range=None,
+              ignoretz=False, tzinfos=None, **kwargs):
+        """
+        Parse ``timestr`` under each declared candidate interpretation.
+
+        :param timestr:
+            A string containing a date/time stamp.
+
+        :param candidates:
+            A non-empty list of candidate interpretations. Each candidate is
+            a dict of keyword arguments forwarded to :meth:`parser._parse`
+            (e.g. ``{"dayfirst": True}``). A candidate is valid only if the
+            resulting datetime satisfies the date range and the default
+            field policy. Candidates that resolve to the same datetime are
+            merged.
+
+        :param default:
+            Injected base :class:`datetime.datetime` used to fill in fields
+            that ``timestr`` does not specify. If ``None``, any candidate
+            that leaves a year/month/day field unset is treated as having
+            no solution -- the current date is never consulted.
+
+        :param date_range:
+            Optional ``(min_dt, max_dt)`` inclusive range. Either side may
+            be ``None`` to leave it open. A candidate whose datetime falls
+            outside the range is discarded.
+
+        :param ignoretz:
+            If set ``True``, time zones in parsed strings are ignored and a
+            naive :class:`datetime.datetime` is returned.
+
+        :param tzinfos:
+            Additional time zone names / aliases which may be present in the
+            string. See :meth:`parser.parse` for details.
+
+        :param \\*\\*kwargs:
+            Keyword arguments forwarded to :meth:`parser._parse`.
+
+        :return:
+            A :class:`StrictParseResult` describing the outcome.
+        """
+        if not candidates:
+            return StrictParseResult(StrictParseResult.NO_SOLUTION)
+
+        valid = []  # list of (candidate, datetime)
+
+        for candidate in candidates:
+            cand_kwargs = dict(candidate)
+            try:
+                res, _ = self._parse(timestr, **cand_kwargs)
+            except Exception:
+                continue
+
+            if res is None:
+                continue
+
+            try:
+                dt = self._build_datetime(res, default, ignoretz, tzinfos)
+            except Exception:
+                continue
+
+            if date_range is not None:
+                lo, hi = date_range
+                if lo is not None and dt < lo:
+                    continue
+                if hi is not None and dt > hi:
+                    continue
+
+            valid.append((candidate, dt))
+
+        # Merge candidates that resolve to the same actual datetime.
+        merged = []
+        index = {}
+        for candidate, dt in valid:
+            if dt in index:
+                pos = index[dt]
+                merged[pos] = (merged[pos][0] + [candidate], dt)
+            else:
+                index[dt] = len(merged)
+                merged.append(([candidate], dt))
+
+        if not merged:
+            return StrictParseResult(StrictParseResult.NO_SOLUTION)
+        elif len(merged) == 1:
+            return StrictParseResult(StrictParseResult.UNIQUE,
+                                     merged[0][1], merged)
+        else:
+            return StrictParseResult(StrictParseResult.AMBIGUOUS, None, merged)
+
+    def _build_datetime(self, res, default, ignoretz, tzinfos):
+        """
+        Build a datetime from a parsed result, enforcing the default field
+        policy.
+
+        When ``default`` is injected, missing fields are filled from it via
+        :meth:`parser._build_naive`. When ``default`` is ``None``, every
+        year/month/day field must be present; the current date is never
+        consulted.
+        """
+        if default is None:
+            if (res.year is None or res.month is None or res.day is None):
+                raise ValueError('Missing date field and no base date '
+                                 'injected')
+
+            repl = {}
+            for attr in ("year", "month", "day", "hour",
+                         "minute", "second", "microsecond"):
+                value = getattr(res, attr)
+                if value is not None:
+                    repl[attr] = value
+
+            # Time fields default to midnight when not specified.
+            for attr in ("hour", "minute", "second", "microsecond"):
+                repl.setdefault(attr, 0)
+
+            naive = datetime.datetime(**repl)
+        else:
+            naive = self._build_naive(res, default)
+
+        if not ignoretz:
+            naive = self._build_tzaware(naive, res, tzinfos)
+
+        return naive
+
+
+def parse_strict(timestr, candidates, parserinfo=None, default=None,
+                 date_range=None, ignoretz=False, tzinfos=None, **kwargs):
+    """
+    Parse a date/time string under explicit candidate interpretations.
+
+    This is a strict alternative to :func:`parse`. Instead of guessing a
+    single day/month order, it tries every declared candidate and reports
+    whether the input has a :attr:`~StrictParseResult.UNIQUE`,
+    :attr:`~StrictParseResult.AMBIGUOUS` or
+    :attr:`~StrictParseResult.NO_SOLUTION` outcome.
+
+    The parser never consults the current date. Missing fields are taken
+    from the injected ``default`` base date; if no base date is injected and
+    a year/month/day field is missing, the candidate is treated as having no
+    solution rather than silently borrowing the current year.
+
+    :param timestr:
+        A string containing a date/time stamp.
+
+    :param candidates:
+        A non-empty list of candidate interpretations. Each candidate is a
+        dict of keyword arguments forwarded to the parser (e.g.
+        ``{"dayfirst": True}``).
+
+    :param parserinfo:
+        A :class:`parserinfo` object containing parameters for the parser.
+        If ``None``, the default arguments to the :class:`parserinfo`
+        constructor are used.
+
+    :param default:
+        Injected base :class:`datetime.datetime` used to fill in fields that
+        ``timestr`` does not specify. If ``None``, any candidate that leaves
+        a year/month/day field unset is treated as having no solution.
+
+    :param date_range:
+        Optional ``(min_dt, max_dt)`` inclusive range. Either side may be
+        ``None`` to leave it open.
+
+    :param ignoretz:
+        If set ``True``, time zones in parsed strings are ignored.
+
+    :param tzinfos:
+        Additional time zone names / aliases. See :func:`parse` for details.
+
+    :param \\*\\*kwargs:
+        Keyword arguments forwarded to the parser.
+
+    :return:
+        A :class:`StrictParseResult` describing the outcome.
+
+    :raises TypeError:
+        Raised for non-string or character stream input.
+    """
+    if parserinfo:
+        p = StrictParser(parserinfo)
+    else:
+        p = StrictParser()
+
+    return p.parse(timestr, candidates, default=default,
+                   date_range=date_range, ignoretz=ignoretz,
+                   tzinfos=tzinfos, **kwargs)
 
 
 class _tzparser(object):
